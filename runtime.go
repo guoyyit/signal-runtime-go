@@ -238,10 +238,31 @@ func (r *Runtime) Exited(pid int) (bool, Signal, error) {
 	return p.dead, p.exitSig, nil
 }
 
+// deliveryBudget bounds how many signals a single delivery loop may
+// deliver before yielding. A loop that keeps finding new work is
+// normally driven by handlers that send further signals; the budget
+// guarantees that such (mutually) self-triggering chains cannot make
+// Send/SetMask/Restore spin forever. Signals left over when the budget
+// is exhausted stay pending — they are not dropped — and are delivered
+// by the next delivery trigger (Send, SetMask, Restore, ...).
+const deliveryBudget = 4096
+
 // deliver runs the delivery loop for p. At most one loop per process runs
 // at a time; concurrent callers return immediately and the active loop
 // picks up their signals, so handlers never execute re-entrantly and no
 // signal is delivered twice.
+//
+// The loop works in rounds. Each round snapshots the currently pending
+// signals (standard bitmap plus the highest queued realtime sequence)
+// and delivers only signals from that snapshot, lowest number first.
+// Signals arriving while a round runs are deferred to the next round,
+// so no signal can be postponed indefinitely by the continuous arrival
+// of lower-numbered ones: every deliverable signal is reached within
+// the round that sees it pending.
+//
+// While a handler runs, the delivered signal is recorded as in-flight
+// and is included in snapshots; a crash mid-handler therefore does not
+// lose it (Restore re-queues it exactly once).
 func (r *Runtime) deliver(p *process) {
 	p.mu.Lock()
 	if p.delivering {
@@ -249,44 +270,80 @@ func (r *Runtime) deliver(p *process) {
 		return
 	}
 	p.delivering = true
+	delivered := 0
 	for {
-		sig, ok := p.nextDeliverableLocked()
-		if !ok || p.dead {
-			break
+		// Round snapshot: standard signals pending right now, and the
+		// highest realtime sequence queued right now. Only these are
+		// eligible until the round ends.
+		roundStd := p.pending
+		var rtMaxSeq uint64
+		for _, e := range p.rtQueue {
+			if e.Seq > rtMaxSeq {
+				rtMaxSeq = e.Seq
+			}
 		}
-		p.popLocked(sig)
-		if sig == SIGCONT {
-			// SIGCONT resumes the process even when caught, and
-			// discards any pending SIGSTOP.
-			p.stopped = false
-			p.pending = p.pending.Del(SIGSTOP)
-		}
-		act := p.actionForLocked(sig)
-		switch act.Kind {
-		case ActionIgnore:
-			// Discard.
-		case ActionHandler:
-			fn, ok := r.registry.Lookup(act.Handler)
-			if !ok {
-				// Handler unknown (e.g. missing after restore):
-				// fall back to the default action.
+		for {
+			sig, ok := p.nextDeliverableLocked(roundStd, rtMaxSeq)
+			if !ok || p.dead {
+				break
+			}
+			// A standard signal is delivered at most once per round:
+			// a new instance arriving mid-round waits for the next one.
+			roundStd = roundStd.Del(sig)
+			seq := p.popLocked(sig)
+			if sig == SIGCONT {
+				// SIGCONT resumes the process even when caught, and
+				// discards any pending SIGSTOP.
+				p.stopped = false
+				p.pending = p.pending.Del(SIGSTOP)
+			}
+			act := p.actionForLocked(sig)
+			switch act.Kind {
+			case ActionIgnore:
+				// Discard.
+			case ActionHandler:
+				fn, ok := r.registry.Lookup(act.Handler)
+				if !ok {
+					// Handler unknown (e.g. missing after restore):
+					// fall back to the default action.
+					r.applyDefaultLocked(p, sig)
+					break
+				}
+				saved := p.mask
+				mask := saved.Union(act.HandlerMask)
+				if !act.NoDefer {
+					mask = mask.Add(sig)
+				}
+				p.mask = mask
+				p.commitInterruptLocked(act.Restart)
+				// Mark the signal in-flight before releasing the
+				// lock: a snapshot taken while the handler runs
+				// preserves it (and the pre-handler mask) so a
+				// crash cannot make it disappear.
+				p.inflightSig = sig
+				p.inflightSeq = seq
+				p.savedMask = saved
+				p.mu.Unlock()
+				fn(p.id, sig)
+				p.mu.Lock()
+				p.inflightSig = 0
+				p.mask = saved
+				p.notifyWaitersLocked()
+			default: // ActionDefault
 				r.applyDefaultLocked(p, sig)
-				continue
 			}
-			saved := p.mask
-			mask := saved.Union(act.HandlerMask)
-			if !act.NoDefer {
-				mask = mask.Add(sig)
+			delivered++
+			if delivered >= deliveryBudget {
+				// The chain of handler-triggered sends is not
+				// converging: yield to the caller. Leftover signals
+				// remain pending for the next delivery trigger.
+				p.delivering = false
+				p.mu.Unlock()
+				return
 			}
-			p.mask = mask
-			p.commitInterruptLocked(act.Restart)
-			p.mu.Unlock()
-			fn(p.id, sig)
-			p.mu.Lock()
-			p.mask = saved
-			p.notifyWaitersLocked()
-		default: // ActionDefault
-			r.applyDefaultLocked(p, sig)
+		}
+		if p.dead || !p.anyDeliverableLocked() {
+			break
 		}
 	}
 	p.delivering = false

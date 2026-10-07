@@ -28,6 +28,15 @@ type process struct {
 	exitSig    Signal // signal that terminated the process, if any
 	delivering bool   // a delivery loop currently owns this process
 
+	// In-flight delivery: a signal whose handler has started (or is
+	// about to start) but has not returned yet. Persisted so that a
+	// crash while a handler runs does not lose the signal: Restore
+	// re-queues it and delivers it exactly once more. At most one
+	// signal is in flight per process because delivery is serialized.
+	inflightSig Signal // 0 when nothing is in flight
+	inflightSeq uint64 // arrival sequence of an in-flight realtime signal
+	savedMask   Set    // process mask to persist while in flight
+
 	// Wait/interrupt state. See wait.go.
 	waitCh      chan struct{} // closed to broadcast wake/interrupt
 	waitGen     uint64        // bumped on every notify
@@ -80,29 +89,42 @@ func (p *process) enqueueLocked(sig Signal, seq uint64) error {
 }
 
 // nextDeliverableLocked picks the next signal to deliver under the
-// documented ordering rules. The caller holds p.mu.
+// documented ordering rules, restricted to one delivery round:
+//   - stdEligible limits which standard signals may be picked this round
+//     (a round snapshot; signals arriving mid-round are not added to it);
+//   - rtMaxSeq limits which realtime entries may be picked this round
+//     (only entries with Seq <= rtMaxSeq, i.e. queued before the round
+//     started).
 //
-// Ordering rules:
+// The caller holds p.mu.
+//
+// Ordering rules within a round:
 //  1. A stopped process only considers SIGKILL and SIGCONT.
 //  2. Otherwise the lowest-numbered unblocked pending signal wins;
 //     standard signals (1-31) therefore precede realtime ones (32-64).
 //  3. Multiple occurrences of one realtime signal are delivered FIFO.
-func (p *process) nextDeliverableLocked() (Signal, bool) {
+//
+// Restricting each round to a snapshot taken at round start is what
+// guarantees freedom from starvation: a signal that keeps arriving
+// while a round runs is only picked up by the next round, so every
+// already-pending deliverable signal is reached within one round.
+func (p *process) nextDeliverableLocked(stdEligible Set, rtMaxSeq uint64) (Signal, bool) {
 	if p.stopped {
+		cand := stdEligible.Intersect(p.pending)
 		switch {
-		case p.pending.Has(SIGKILL):
+		case cand.Has(SIGKILL):
 			return SIGKILL, true
-		case p.pending.Has(SIGCONT):
+		case cand.Has(SIGCONT):
 			return SIGCONT, true
 		}
 		return 0, false
 	}
-	if sig, ok := p.pending.Intersect(^p.mask).Lowest(); ok {
+	if sig, ok := stdEligible.Intersect(p.pending).Intersect(^p.mask).Lowest(); ok {
 		return sig, true
 	}
 	best := -1
 	for i, e := range p.rtQueue {
-		if p.mask.Has(e.Sig) {
+		if e.Seq > rtMaxSeq || p.mask.Has(e.Sig) {
 			continue
 		}
 		if best < 0 || e.Sig < p.rtQueue[best].Sig ||
@@ -116,17 +138,28 @@ func (p *process) nextDeliverableLocked() (Signal, bool) {
 	return p.rtQueue[best].Sig, true
 }
 
-// popLocked removes sig from the pending state. The caller holds p.mu.
-// For realtime signals the oldest queued occurrence is removed.
-func (p *process) popLocked(sig Signal) {
+// anyDeliverableLocked reports whether any signal is deliverable right
+// now, ignoring round restrictions. The caller holds p.mu.
+func (p *process) anyDeliverableLocked() bool {
+	_, ok := p.nextDeliverableLocked(p.pending, ^uint64(0))
+	return ok
+}
+
+// popLocked removes sig from the pending state and returns the arrival
+// sequence of the removed realtime entry (0 for standard signals).
+// The caller holds p.mu. For realtime signals the oldest queued
+// occurrence is removed; entries queued after the round snapshot always
+// sit behind older ones, so the removed entry is the round-eligible one.
+func (p *process) popLocked(sig Signal) uint64 {
 	if !sig.Realtime() {
 		p.pending = p.pending.Del(sig)
-		return
+		return 0
 	}
 	for i, e := range p.rtQueue {
 		if e.Sig == sig {
 			p.rtQueue = append(p.rtQueue[:i], p.rtQueue[i+1:]...)
-			return
+			return e.Seq
 		}
 	}
+	return 0
 }
