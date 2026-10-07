@@ -21,6 +21,7 @@ type procSnapshot struct {
 	Actions  map[Signal]Action `json:"actions,omitempty"`
 	Pending  Set               `json:"pending"`
 	RTQueue  []rtEntry         `json:"rt_queue,omitempty"`
+	Inflight *rtEntry          `json:"inflight,omitempty"`
 	Overflow uint64            `json:"overflow,omitempty"`
 	Stopped  bool              `json:"stopped"`
 	Dead     bool              `json:"dead"`
@@ -31,6 +32,11 @@ type procSnapshot struct {
 // masks, pending queues, stop and exit state. Handler functions are stored
 // by registry name; restoring into a Runtime whose registry lacks a name
 // keeps the disposition but the handler is dropped to ActionDefault.
+//
+// A signal whose handler is running when the snapshot is taken (popped
+// from the pending state but not yet fully delivered) is preserved in the
+// Inflight field, and Mask records the mask as it was before that handler
+// started, so the restored runtime can complete the delivery exactly once.
 func (r *Runtime) Snapshot() ([]byte, error) {
 	r.mu.Lock()
 	pids := make([]int, 0, len(r.procs))
@@ -42,15 +48,25 @@ func (r *Runtime) Snapshot() ([]byte, error) {
 	for _, pid := range pids {
 		p := r.procs[pid]
 		p.mu.Lock()
+		mask := p.mask
+		if p.inflight != nil {
+			// A handler is in flight: the transient handler mask is
+			// a delivery artifact; persist the durable mask instead.
+			mask = p.savedMask
+		}
 		ps := procSnapshot{
 			ID:       p.id,
 			Group:    p.group,
-			Mask:     p.mask,
+			Mask:     mask,
 			Pending:  p.pending,
 			Overflow: p.overflow,
 			Stopped:  p.stopped,
 			Dead:     p.dead,
 			ExitSig:  p.exitSig,
+		}
+		if p.inflight != nil {
+			inflight := *p.inflight
+			ps.Inflight = &inflight
 		}
 		if len(p.actions) > 0 {
 			ps.Actions = make(map[Signal]Action, len(p.actions))
@@ -73,6 +89,12 @@ func (r *Runtime) Snapshot() ([]byte, error) {
 // are not delivered during Restore itself, but a delivery pass runs
 // afterwards so unblocked pending signals are delivered without loss or
 // duplication.
+//
+// A signal that was in flight when the snapshot was taken (its handler had
+// started but the delivery had not completed) is re-queued — standard
+// signals return to the pending set, realtime signals are re-inserted into
+// the queue in sequence order — so the crash cannot make it vanish and the
+// post-restore delivery pass completes its delivery exactly once.
 func Restore(data []byte, reg *HandlerRegistry) (*Runtime, error) {
 	var snap snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
@@ -96,6 +118,28 @@ func Restore(data []byte, reg *HandlerRegistry) (*Runtime, error) {
 		for sig := MinStandard; sig <= MaxStandard; sig++ {
 			if ps.Pending.Has(sig) {
 				pending = pending.Add(sig)
+			}
+		}
+		// Re-queue a signal that was in flight at snapshot time: the
+		// crash interrupted its delivery, so it must be delivered once
+		// more. Realtime occurrences keep their sequence number, which
+		// preserves both the per-signal FIFO order and the queue's
+		// arrival-order sort.
+		if ps.Inflight != nil && ps.Inflight.Sig.Valid() {
+			e := *ps.Inflight
+			if e.Sig.Realtime() {
+				pos := len(queue)
+				for i, qe := range queue {
+					if qe.Seq > e.Seq {
+						pos = i
+						break
+					}
+				}
+				queue = append(queue, rtEntry{})
+				copy(queue[pos+1:], queue[pos:])
+				queue[pos] = e
+			} else {
+				pending = pending.Add(e.Sig)
 			}
 		}
 		p := &process{

@@ -242,6 +242,18 @@ func (r *Runtime) Exited(pid int) (bool, Signal, error) {
 // at a time; concurrent callers return immediately and the active loop
 // picks up their signals, so handlers never execute re-entrantly and no
 // signal is delivered twice.
+//
+// The loop delivers in passes (see nextDeliverableLocked): signals that
+// arrive during a pass are deferred to the next pass, which guarantees
+// every unblocked pending signal is delivered within a bounded number of
+// deliveries. A single activation runs at most maxDeliveryPasses passes;
+// if handler-triggered sends keep regenerating work, the loop stops and
+// the remaining signals stay pending until the next delivery trigger, so
+// no API call can loop forever.
+//
+// While a handler runs, the signal being delivered is recorded in
+// p.inflight (and the pre-handler mask in p.savedMask) so that a snapshot
+// taken mid-delivery preserves it for recovery.
 func (r *Runtime) deliver(p *process) {
 	p.mu.Lock()
 	if p.delivering {
@@ -249,12 +261,14 @@ func (r *Runtime) deliver(p *process) {
 		return
 	}
 	p.delivering = true
+	p.passes = 0
 	for {
-		sig, ok := p.nextDeliverableLocked()
+		sig, seq, ok := p.nextDeliverableLocked()
 		if !ok || p.dead {
 			break
 		}
-		p.popLocked(sig)
+		p.popLocked(sig, seq)
+		p.inflight = &rtEntry{Sig: sig, Seq: seq}
 		if sig == SIGCONT {
 			// SIGCONT resumes the process even when caught, and
 			// discards any pending SIGSTOP.
@@ -265,11 +279,13 @@ func (r *Runtime) deliver(p *process) {
 		switch act.Kind {
 		case ActionIgnore:
 			// Discard.
+			p.inflight = nil
 		case ActionHandler:
 			fn, ok := r.registry.Lookup(act.Handler)
 			if !ok {
 				// Handler unknown (e.g. missing after restore):
 				// fall back to the default action.
+				p.inflight = nil
 				r.applyDefaultLocked(p, sig)
 				continue
 			}
@@ -279,14 +295,17 @@ func (r *Runtime) deliver(p *process) {
 				mask = mask.Add(sig)
 			}
 			p.mask = mask
+			p.savedMask = saved
 			p.commitInterruptLocked(act.Restart)
 			p.mu.Unlock()
 			fn(p.id, sig)
 			p.mu.Lock()
+			p.inflight = nil
 			p.mask = saved
 			p.notifyWaitersLocked()
 		default: // ActionDefault
 			r.applyDefaultLocked(p, sig)
+			p.inflight = nil
 		}
 	}
 	p.delivering = false
